@@ -1,0 +1,7 @@
+.env
+.cache/
+*.pdf
+go.work
+go.work.sum
+/leafrun-projects
+/leafrun-projects.exe

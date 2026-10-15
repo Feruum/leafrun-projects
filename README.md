@@ -1,13 +1,20 @@
 # leafrun-projects
 
-## Describe templates and releases
+Projects owns immutable, technically validated project revisions and release
+candidates. It reads a scoped Storage snapshot, verifies every resource against
+the manifest, and asks Document Core to validate the project and describe each
+target. It never invokes Typst. Release candidates become ready only after a
+durable Storage pin is confirmed active.
 
-The planned Projects service will record project metadata, parameter definitions, and published template releases. A caller should be able to select a release and supply values such as customer name or invoice number.
+The service roles include separate API, reconciliation, migration, and
+JetStream event-relay processes. Their configuration, API routes, outbox
+behavior, and local test workflow are documented in [the service guide](docs/service.md).
+The versioned HTTP types live in `leafrun-contracts/projects/v1`.
 
-Integrations handles external source connections; Collaboration owns working files; Generation renders a selected fixed revision.
-
-**Status:** this repository is planned and has no runnable implementation yet. For code you can try now, see the [local prototypes](https://github.com/leafrun/leafrun/blob/main/docs/repositories.md).
-
-**First roadmap step:** [LEA-33 — Define template parameters](https://linear.app/bulnik/issue/LEA-33/e05-kontrakt-proekta-parametry-i-relizy). Linear may require workspace access; the public [roadmap](https://github.com/leafrun/leafrun/blob/main/docs/roadmap.md) explains the build order. See the [repository map](https://github.com/leafrun/leafrun/blob/main/docs/repositories.md) and [contribution guide](https://github.com/leafrun/leafrun/blob/main/CONTRIBUTING.md).
+The API includes revision registration/read/tombstone, release pin reconciliation,
+publication with compare-and-swap, an authorized catalog and versioned form, and
+Generation owner resolution. Resolution uses Core once to prepare defaults,
+file inputs and the selected frozen profile. Working generation requires source
+read; a published release can be generated without source-read permission.
 
 No project license has been selected yet.
