@@ -1,6 +1,7 @@
 package service
 
 import (
+	"bytes"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
@@ -269,7 +270,16 @@ func queryScope(query url.Values) (storagev1.Scope, error) {
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {
-	data, err := json.Marshal(value)
+	var data bytes.Buffer
+	encoder := json.NewEncoder(&data)
+	// Responses are application/json, never HTML. Preserve bounded raw schema
+	// resources instead of expanding their <, > and & characters to escapes.
+	encoder.SetEscapeHTML(false)
+	err := encoder.Encode(value)
+	writeJSONData(w, status, data.Bytes(), err)
+}
+
+func writeJSONData(w http.ResponseWriter, status int, data []byte, err error) {
 	if err != nil || int64(len(data)) > projectsv1.ResponseLimit {
 		writeFault(w, fault(http.StatusRequestEntityTooLarge, "response_too_large", "Projects response exceeds the 12 MiB limit"))
 		return
