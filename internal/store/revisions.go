@@ -207,13 +207,25 @@ func (s *Store) TombstoneRevision(ctx context.Context, scope projectsv1.Scope, r
 	if !projectsv1.ValidScope(scope) || !projectsv1.ValidIdentifier(revisionID) {
 		return ErrNotFound
 	}
-	tag, err := s.pool.Exec(ctx, `UPDATE projects_revisions SET deleted_at=COALESCE(deleted_at,clock_timestamp())
-		WHERE workspace_id=$1 AND project_id=$2 AND revision_id=$3`, scope.WorkspaceID, scope.ProjectID, revisionID)
+	tx, err := begin(ctx, s.pool)
+	if err != nil {
+		return err
+	}
+	defer rollback(ctx, tx)
+	var binding MutationBinding
+	if err = tx.QueryRow(ctx, `SELECT workspace_id,project_id,revision_id FROM projects_revisions WHERE workspace_id=$1 AND project_id=$2 AND revision_id=$3 FOR UPDATE`, scope.WorkspaceID, scope.ProjectID, revisionID).Scan(&binding.Scope.WorkspaceID, &binding.Scope.ProjectID, &binding.ObjectID); errors.Is(err, pgx.ErrNoRows) {
+		return ErrNotFound
+	} else if err != nil {
+		return fmt.Errorf("lock Projects working revision: %w", err)
+	}
+	_, err = tx.Exec(ctx, `UPDATE projects_revisions SET deleted_at=COALESCE(deleted_at,clock_timestamp())
+		WHERE workspace_id=$1 AND project_id=$2 AND revision_id=$3`, binding.Scope.WorkspaceID, binding.Scope.ProjectID, binding.ObjectID)
 	if err != nil {
 		return fmt.Errorf("tombstone Projects working revision: %w", err)
 	}
-	if tag.RowsAffected() == 0 {
-		return ErrNotFound
+	binding.Operation = "project.write"
+	if err = s.gateCurrentMutation(ctx, binding); err != nil {
+		return err
 	}
-	return nil
+	return tx.Commit(ctx)
 }

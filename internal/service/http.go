@@ -13,6 +13,7 @@ import (
 	jsonvalue "github.com/leafrun/leafrun-contracts/jsonvalue/v1"
 	projectsv1 "github.com/leafrun/leafrun-contracts/projects/v1"
 	storagev1 "github.com/leafrun/leafrun-contracts/storage/v1"
+	"github.com/leafrun/leafrun-platform/authn"
 	"github.com/leafrun/leafrun-projects/internal/store"
 )
 
@@ -20,6 +21,7 @@ const maxRequestBytes = int64(1 << 20)
 
 func (r *Runtime) Handler() http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("POST /internal/v1/scopes/verify", r.handleVerifyLegacyScope)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
@@ -42,7 +44,7 @@ func (r *Runtime) Handler() http.Handler {
 	mux.HandleFunc("POST /internal/v1/resolve", r.handleResolve)
 	mux.HandleFunc("POST /internal/v1/checks/release", r.handleCurrentRelease)
 	mux.HandleFunc("POST /internal/v1/checks/pin-owner", r.handlePinOwner)
-	return mux
+	return r.publicBoundary(mux)
 }
 
 func (r *Runtime) HealthHandler() http.Handler {
@@ -61,6 +63,10 @@ func (r *Runtime) HealthHandler() http.Handler {
 }
 
 func (r *Runtime) principal(request *http.Request) (projectsv1.Principal, bool) {
+	if r.Config.AuthMode == "access" {
+		id, ok := authn.IdentityFromContext(request.Context())
+		return id.Principal, ok
+	}
 	values := request.Header.Values("Authorization")
 	if len(values) != 1 {
 		return projectsv1.Principal{}, false
@@ -96,7 +102,7 @@ func (r *Runtime) handleRegisterRevision(w http.ResponseWriter, request *http.Re
 		writeFault(w, err)
 		return
 	}
-	allowed, err := r.Access.Check(request.Context(), storagev1.AccessCheck{Principal: principal, Scope: input.Scope, Operation: "project.write", ObjectID: input.SnapshotID})
+	allowed, err := r.checkAccess(request.Context(), storagev1.AccessCheck{Principal: principal, Scope: input.Scope, Operation: "project.write", ObjectID: input.SnapshotID})
 	if err != nil {
 		writeFault(w, fault(http.StatusServiceUnavailable, "access_unavailable", "Projects could not verify current project rights"))
 		return
@@ -124,7 +130,7 @@ func (r *Runtime) handleGetRevision(w http.ResponseWriter, request *http.Request
 		writeFault(w, err)
 		return
 	}
-	allowed, accessErr := r.Access.Check(request.Context(), storagev1.AccessCheck{Principal: principal, Scope: scope, Operation: "project.read", ObjectID: request.PathValue("revision")})
+	allowed, accessErr := r.checkAccess(request.Context(), storagev1.AccessCheck{Principal: principal, Scope: scope, Operation: "project.read", ObjectID: request.PathValue("revision")})
 	if accessErr != nil {
 		writeFault(w, fault(http.StatusServiceUnavailable, "access_unavailable", "Projects could not verify current project rights"))
 		return
@@ -152,7 +158,7 @@ func (r *Runtime) handleDeleteRevision(w http.ResponseWriter, request *http.Requ
 		writeFault(w, err)
 		return
 	}
-	allowed, err := r.Access.Check(request.Context(), storagev1.AccessCheck{Principal: principal, Scope: input.Scope, Operation: "project.write", ObjectID: request.PathValue("revision")})
+	allowed, err := r.checkAccess(request.Context(), storagev1.AccessCheck{Principal: principal, Scope: input.Scope, Operation: "project.write", ObjectID: request.PathValue("revision")})
 	if err != nil {
 		writeFault(w, fault(http.StatusServiceUnavailable, "access_unavailable", "Projects could not verify current project rights"))
 		return
@@ -179,7 +185,7 @@ func (r *Runtime) handleCreateRelease(w http.ResponseWriter, request *http.Reque
 		writeFault(w, err)
 		return
 	}
-	allowed, err := r.Access.Check(request.Context(), storagev1.AccessCheck{Principal: principal, Scope: input.Scope, Operation: "project.publish", ObjectID: input.Revision})
+	allowed, err := r.checkAccess(request.Context(), storagev1.AccessCheck{Principal: principal, Scope: input.Scope, Operation: "project.publish", ObjectID: input.Revision})
 	if err != nil {
 		writeFault(w, fault(http.StatusServiceUnavailable, "access_unavailable", "Projects could not verify current project rights"))
 		return
@@ -188,7 +194,7 @@ func (r *Runtime) handleCreateRelease(w http.ResponseWriter, request *http.Reque
 		writeFault(w, fault(http.StatusForbidden, "forbidden", "Current project rights do not allow release creation"))
 		return
 	}
-	out, err := r.Store.CreateRelease(request.Context(), store.CreateReleaseInput{Actor: principal, Request: input, IdempotencyKey: input.IdempotencyKey})
+	out, err := r.Store.CreateRelease(request.Context(), store.CreateReleaseInput{Identity: requestIdentity(request.Context()), Actor: principal, Request: input, IdempotencyKey: input.IdempotencyKey})
 	if err != nil {
 		writeFault(w, storeFault(err))
 		return
@@ -207,7 +213,7 @@ func (r *Runtime) handleGetRelease(w http.ResponseWriter, request *http.Request)
 		writeFault(w, storeFault(err))
 		return
 	}
-	allowed, err := r.Access.Check(request.Context(), storagev1.AccessCheck{Principal: principal, Scope: out.Scope, Operation: "project.read", ObjectID: out.ReleaseID})
+	allowed, err := r.checkAccess(request.Context(), storagev1.AccessCheck{Principal: principal, Scope: out.Scope, Operation: "project.read", ObjectID: out.ReleaseID})
 	if err != nil {
 		writeFault(w, fault(http.StatusServiceUnavailable, "access_unavailable", "Projects could not verify current project rights"))
 		return
@@ -220,7 +226,7 @@ func (r *Runtime) handleGetRelease(w http.ResponseWriter, request *http.Request)
 }
 
 func (r *Runtime) handlePinOwner(w http.ResponseWriter, request *http.Request) {
-	if !authorizedToken(request.Header.Get("Authorization"), r.Config.OwnerCallbackToken) {
+	if !r.localToken(request, r.Config.OwnerCallbackToken) {
 		writeFault(w, fault(http.StatusUnauthorized, "unauthorized", "Projects owner callback credential is required"))
 		return
 	}
@@ -242,6 +248,9 @@ func decodeRequest(w http.ResponseWriter, request *http.Request, out any) error 
 }
 
 func decodeRequestLimit(w http.ResponseWriter, request *http.Request, out any, limit int64) error {
+	if authn.RequireMediaType(request, "application/json") != nil {
+		return fault(400, "invalid_media_type", "application/json content type required")
+	}
 	request.Body = http.MaxBytesReader(w, request.Body, limit+1)
 	data, err := io.ReadAll(io.LimitReader(request.Body, limit+1))
 	if err != nil || int64(len(data)) > limit {

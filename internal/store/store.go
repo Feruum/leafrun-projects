@@ -10,14 +10,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/fs"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	jsonvalue "github.com/leafrun/leafrun-contracts/jsonvalue/v1"
-	"github.com/leafrun/leafrun-platform/events"
 )
 
 //go:embed migrations/*.sql
@@ -47,9 +46,13 @@ type Config struct {
 }
 
 type Store struct {
-	pool            *pgxpool.Pool
-	pinHolderID     string
-	pinHolderDomain string
+	pool                *pgxpool.Pool
+	pinHolderID         string
+	pinHolderDomain     string
+	gateMu              sync.RWMutex
+	authorityGate       AuthorityGate
+	currentMutationGate CurrentMutationGate
+	auditScopeGate      AuditScopeGate
 }
 
 func New(pool *pgxpool.Pool, config Config) (*Store, error) {
@@ -68,31 +71,6 @@ func New(pool *pgxpool.Pool, config Config) (*Store, error) {
 	return &Store{pool: pool, pinHolderID: config.PinHolderID, pinHolderDomain: config.PinHolderDomain}, nil
 }
 
-func (s *Store) Migrate(ctx context.Context) error {
-	if s == nil || s.pool == nil {
-		return errors.New("Projects store is required")
-	}
-	if err := events.ApplyMigration(ctx, s.pool); err != nil {
-		return fmt.Errorf("apply Platform outbox migration: %w", err)
-	}
-	sql, err := fs.ReadFile(migrations, "migrations/001_projects.sql")
-	if err != nil {
-		return fmt.Errorf("read Projects migration: %w", err)
-	}
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("begin Projects migration: %w", err)
-	}
-	defer tx.Rollback(ctx)
-	if _, err = tx.Exec(ctx, string(sql)); err != nil {
-		return fmt.Errorf("apply Projects migration: %w", err)
-	}
-	if err = tx.Commit(ctx); err != nil {
-		return fmt.Errorf("commit Projects migration: %w", err)
-	}
-	return nil
-}
-
 func (s *Store) Ready(ctx context.Context) error {
 	if err := s.pool.Ping(ctx); err != nil {
 		return fmt.Errorf("Projects database unavailable: %w", err)
@@ -101,9 +79,26 @@ func (s *Store) Ready(ctx context.Context) error {
 	if err := s.pool.QueryRow(ctx, `SELECT version FROM projects_schema_version WHERE singleton=true`).Scan(&version); err != nil {
 		return fmt.Errorf("Projects schema is unavailable: %w", err)
 	}
-	if version != 1 {
+	n, ledgerErr := projectsLedger(ctx, s.pool)
+	if ledgerErr != nil {
+		return ledgerErr
+	}
+	if n != len(projectsMigrationFiles) {
+		return errors.New("Projects schema upgrade required")
+	}
+	if version != 3 {
 		return fmt.Errorf("unsupported Projects schema version %d", version)
 	}
+	rows, err := s.pool.Query(ctx, `SELECT r.original_identity,p.original_identity FROM projects_releases r LEFT JOIN projects_release_pin_acquires p ON p.release_id=r.release_id LIMIT 0`)
+	if err != nil {
+		return fmt.Errorf("Projects authority schema unavailable: %w", err)
+	}
+	rows.Close()
+	rows, err = s.pool.Query(ctx, `SELECT a.event_id,a.operation_id,a.release_id,a.revision,a.occurred_at,a.context,o.encoded_envelope FROM projects_audit_actions a LEFT JOIN platform_event_outbox o ON o.event_id=a.event_id::text LIMIT 0`)
+	if err != nil {
+		return err
+	}
+	rows.Close()
 	return nil
 }
 

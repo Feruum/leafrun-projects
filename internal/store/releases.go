@@ -10,12 +10,14 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	identityv1 "github.com/leafrun/leafrun-contracts/identity/v1"
 	projectsv1 "github.com/leafrun/leafrun-contracts/projects/v1"
 	storagev1 "github.com/leafrun/leafrun-contracts/storage/v1"
 	"github.com/leafrun/leafrun-platform/events"
 )
 
 type CreateReleaseInput struct {
+	Identity       *identityv1.Identity
 	Actor          projectsv1.Principal
 	Request        projectsv1.CreateReleaseRequest
 	IdempotencyKey string
@@ -39,6 +41,17 @@ type ReleasePinWork struct {
 }
 
 func (s *Store) CreateRelease(ctx context.Context, input CreateReleaseInput) (projectsv1.Release, error) {
+	if input.Identity != nil && (input.Identity.Validate() != nil || input.Identity.Principal != input.Actor || input.Identity.Authority.Kind == "dev" || input.Identity.Authority.Kind == "service") {
+		return projectsv1.Release{}, ErrAuthorityDenied
+	}
+	var originalIdentity any
+	if input.Identity != nil {
+		raw, err := json.Marshal(input.Identity)
+		if err != nil {
+			return projectsv1.Release{}, err
+		}
+		originalIdentity = raw
+	}
 	request := input.Request
 	if !projectsv1.ValidScope(request.Scope) || !projectsv1.ValidIdentifier(request.Revision) || !projectsv1.ValidIdentifier(request.TargetID) || !projectsv1.ValidIdentifier(request.Version) || !validIdempotencyKey(input.IdempotencyKey) || !projectsv1.ValidIdentifier(input.Actor.Subject) || !projectsv1.ValidIdentifier(input.Actor.Domain) {
 		return projectsv1.Release{}, errors.New("scope, revision, target, version, actor, and idempotency key are required")
@@ -156,18 +169,18 @@ func (s *Store) CreateRelease(ctx context.Context, input CreateReleaseInput) (pr
 	if err != nil {
 		return projectsv1.Release{}, err
 	}
-	_, err = tx.Exec(ctx, `INSERT INTO projects_releases(release_id,workspace_id,project_id,revision_id,target_id,version,snapshot_id,content_id,descriptor_digest,descriptor,state,created_at,updated_at)
-		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,'pin_pending',$11,$11)`, releaseID,
+	_, err = tx.Exec(ctx, `INSERT INTO projects_releases(release_id,workspace_id,project_id,revision_id,target_id,version,snapshot_id,content_id,descriptor_digest,descriptor,state,created_at,updated_at,original_identity)
+		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,'pin_pending',$11,$11,$12::jsonb)`, releaseID,
 		request.Scope.WorkspaceID, request.Scope.ProjectID, request.Revision, request.TargetID, request.Version,
-		revision.SnapshotID, revision.ContentID, descriptor.Digest, descriptorJSON, now)
+		revision.SnapshotID, revision.ContentID, descriptor.Digest, descriptorJSON, now, originalIdentity)
 	if err != nil {
 		if pgConflict(err) {
 			return projectsv1.Release{}, ErrConflict
 		}
 		return projectsv1.Release{}, fmt.Errorf("insert immutable Projects release candidate: %w", err)
 	}
-	if _, err = tx.Exec(ctx, `INSERT INTO projects_release_pin_acquires(release_id,acquire_number,idempotency_key,request,state,created_at)
-		VALUES($1,1,$2,$3::jsonb,'intent',$4)`, releaseID, acquireKey, acquireJSON, now); err != nil {
+	if _, err = tx.Exec(ctx, `INSERT INTO projects_release_pin_acquires(release_id,acquire_number,idempotency_key,request,state,created_at,original_identity)
+		VALUES($1,1,$2,$3::jsonb,'intent',$4,$5::jsonb)`, releaseID, acquireKey, acquireJSON, now, originalIdentity); err != nil {
 		return projectsv1.Release{}, fmt.Errorf("persist release pin acquisition intent: %w", err)
 	}
 	if err = insertReleaseReceipt(ctx, tx, request, principal, input.IdempotencyKey, fingerprint, releaseID, now); err != nil {
@@ -358,7 +371,7 @@ func (s *Store) RecordPinAcquired(ctx context.Context, lease Lease, intent PinAc
 	if err = tx.Commit(ctx); err != nil {
 		return false, fmt.Errorf("persist acquired Storage pin reference: %w", err)
 	}
-	return releaseState == "tombstoned", nil
+	return (releaseState == "tombstoned" || releaseState == "failed"), nil
 }
 
 func (s *Store) MarkPinActive(ctx context.Context, lease Lease, intent PinAcquireIntent, pin storagev1.Pin) (bool, error) {
@@ -416,8 +429,23 @@ func (s *Store) MarkPinActive(ctx context.Context, lease Lease, intent PinAcquir
 			return false, err
 		}
 	}
+	if releaseState != "tombstoned" && releaseState != "failed" {
+		if err = s.gateAuthority(ctx, tx, intent.ReleaseID, true); err != nil {
+			return false, err
+		}
+	}
+	if err = checkLease(ctx, tx, lease); err != nil {
+		return false, err
+	}
+	var livePin bool
+	if err = tx.QueryRow(ctx, `SELECT $1::timestamptz>clock_timestamp()`, pin.ExpiresAt).Scan(&livePin); err != nil {
+		return false, err
+	}
+	if !livePin {
+		return false, ErrInvalidState
+	}
 	if err = tx.Commit(ctx); err != nil {
 		return false, fmt.Errorf("commit release after active pin confirmation: %w", err)
 	}
-	return releaseState == "tombstoned", nil
+	return (releaseState == "tombstoned" || releaseState == "failed"), nil
 }

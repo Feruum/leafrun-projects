@@ -79,6 +79,10 @@ func (r *Runtime) registerSnapshot(ctx context.Context, scope storagev1.Scope, r
 }
 
 func (r *Runtime) restoreSnapshot(ctx context.Context, scope storagev1.Scope, snapshotID string) (stagedSnapshot, error) {
+	ctx = context.WithValue(ctx, snapshotScopeKey{}, scope)
+	if err := r.snapshotAuthority(ctx, scope); err != nil {
+		return stagedSnapshot{}, err
+	}
 	response, err := r.Storage.GetSnapshot(ctx, snapshotID)
 	if err != nil {
 		return stagedSnapshot{}, storageFault(err, "snapshot_unavailable")
@@ -122,6 +126,9 @@ func (r *Runtime) restoreSnapshot(ctx context.Context, scope storagev1.Scope, sn
 	for _, resourceID := range refs {
 		if _, seen := metadata[resourceID]; seen {
 			continue
+		}
+		if err := r.snapshotAuthority(ctx, scope); err != nil {
+			return stagedSnapshot{}, err
 		}
 		resource, metadataErr := r.Storage.GetResource(ctx, resourceID)
 		if metadataErr != nil {
@@ -233,6 +240,11 @@ func safeStagedPath(root, name string) (string, error) {
 }
 
 func (r *Runtime) copyVerifiedResource(ctx context.Context, resourceID string, expectedSize int64, expectedHash, path string) error {
+	if scope, ok := ctx.Value(snapshotScopeKey{}).(storagev1.Scope); ok {
+		if err := r.snapshotAuthority(ctx, scope); err != nil {
+			return err
+		}
+	}
 	response, err := r.Storage.ResourceContent(ctx, resourceID)
 	if err != nil {
 		return storageFault(err, "snapshot_resource_unavailable")

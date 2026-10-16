@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	auditv1 "github.com/leafrun/leafrun-contracts/audit/v1"
 	projectsv1 "github.com/leafrun/leafrun-contracts/projects/v1"
 	storagev1 "github.com/leafrun/leafrun-contracts/storage/v1"
 )
@@ -83,7 +84,7 @@ func (s *Store) ListPinWork(ctx context.Context, lease Lease) ([]ReleasePinWork,
 		return nil, ErrLeaseLost
 	}
 	rows, err := s.pool.Query(ctx, `SELECT release_id,state,COALESCE(pin_id,'') FROM projects_releases
-		WHERE state='pin_pending' OR (state='tombstoned' AND cleanup_completed_at IS NULL)
+		WHERE state='pin_pending' OR (state IN ('tombstoned','failed') AND cleanup_completed_at IS NULL)
 		ORDER BY created_at,release_id LIMIT $1`, maxReconcile)
 	if err != nil {
 		return nil, err
@@ -176,7 +177,7 @@ func (s *Store) RecordPinExpired(ctx context.Context, lease Lease, intent PinAcq
 		WHERE release_id=$1 AND acquire_number=$2`, intent.ReleaseID, intent.Number); err != nil {
 		return PinAcquireIntent{}, err
 	}
-	if releaseState == "tombstoned" {
+	if releaseState == "tombstoned" || releaseState == "failed" {
 		var unresolved bool
 		if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM projects_release_pin_acquires
 			WHERE release_id=$1 AND state NOT IN ('expired','released'))`, intent.ReleaseID).Scan(&unresolved); err != nil {
@@ -212,8 +213,8 @@ func (s *Store) RecordPinExpired(ctx context.Context, lease Lease, intent PinAcq
 	if err != nil {
 		return PinAcquireIntent{}, err
 	}
-	if _, err = tx.Exec(ctx, `INSERT INTO projects_release_pin_acquires(release_id,acquire_number,idempotency_key,request,state)
-		VALUES($1,$2,$3,$4::jsonb,'intent')`, intent.ReleaseID, latest+1, newKey, requestBytes); err != nil {
+	if _, err = tx.Exec(ctx, `INSERT INTO projects_release_pin_acquires(release_id,acquire_number,idempotency_key,request,state,original_identity)
+		VALUES($1,$2,$3,$4::jsonb,'intent',(SELECT original_identity FROM projects_releases WHERE release_id=$1))`, intent.ReleaseID, latest+1, newKey, requestBytes); err != nil {
 		return PinAcquireIntent{}, err
 	}
 	if _, err = tx.Exec(ctx, `UPDATE projects_releases SET pin_id=NULL,updated_at=clock_timestamp()
@@ -235,12 +236,12 @@ func (s *Store) TombstoneRelease(ctx context.Context, releaseID string, scope pr
 		return err
 	}
 	defer rollback(ctx, tx)
-	var workspaceID, projectID, state string
+	var workspaceID, projectID, state, lockedReleaseID string
 	var published bool
 	var version int64
 	var releaseVersion uint64
-	err = tx.QueryRow(ctx, `SELECT workspace_id,project_id,state,published,publication_version,aggregate_version
-		FROM projects_releases WHERE release_id=$1 FOR UPDATE`, releaseID).Scan(&workspaceID, &projectID, &state, &published, &version, &releaseVersion)
+	err = tx.QueryRow(ctx, `SELECT workspace_id,project_id,state,published,publication_version,aggregate_version,release_id
+		FROM projects_releases WHERE release_id=$1 FOR UPDATE`, releaseID).Scan(&workspaceID, &projectID, &state, &published, &version, &releaseVersion, &lockedReleaseID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrNotFound
 	}
@@ -251,6 +252,9 @@ func (s *Store) TombstoneRelease(ctx context.Context, releaseID string, scope pr
 		return ErrNotFound
 	}
 	if state == "tombstoned" {
+		if err = s.gateCurrentMutation(ctx, MutationBinding{Scope: projectsv1.Scope{WorkspaceID: workspaceID, ProjectID: projectID}, Operation: "project.publish", ObjectID: lockedReleaseID}); err != nil {
+			return err
+		}
 		return tx.Commit(ctx)
 	}
 	if published {
@@ -271,6 +275,16 @@ func (s *Store) TombstoneRelease(ctx context.Context, releaseID string, scope pr
 		return err
 	}
 	if err = enqueueReleaseEvent(ctx, tx, scope, releaseID, releaseVersion+1, now, "projects.release.deleted", "leafrun.projects.release.deleted.v1"); err != nil {
+		return err
+	}
+	ctx, audit, err := s.publicationAudit(ctx, MutationBinding{Scope: scope, Operation: "project.publish", ObjectID: lockedReleaseID}, releaseVersion+1, now, auditv1.ActionReleaseRetire)
+	if err != nil {
+		return err
+	}
+	if err = enqueuePublicationAudit(ctx, tx, audit); err != nil {
+		return err
+	}
+	if err = s.gateCurrentMutation(ctx, MutationBinding{Scope: projectsv1.Scope{WorkspaceID: workspaceID, ProjectID: projectID}, Operation: "project.publish", ObjectID: lockedReleaseID}); err != nil {
 		return err
 	}
 	if err = tx.Commit(ctx); err != nil {
@@ -301,7 +315,7 @@ func (s *Store) RecordPinReleased(ctx context.Context, lease Lease, intent PinAc
 	if err != nil {
 		return err
 	}
-	if state != "tombstoned" {
+	if state != "tombstoned" && state != "failed" {
 		return ErrInvalidState
 	}
 	var requestBytes []byte
@@ -353,7 +367,7 @@ func (s *Store) PinOwner(ctx context.Context, check storagev1.PinOwnerCheck) sto
 			SELECT 1 FROM projects_release_pin_acquires a
 			JOIN projects_releases r ON r.release_id=a.release_id
 			WHERE COALESCE(a.pin_id,'')='' AND a.state='intent'
-			AND (r.state='pin_pending' OR (r.state='tombstoned' AND r.cleanup_completed_at IS NULL))
+			AND (r.state='pin_pending' OR (r.state IN ('tombstoned','failed') AND r.cleanup_completed_at IS NULL))
 			AND r.workspace_id=$1 AND r.project_id=$2
 			AND a.request->>'objectId'=$3 AND a.request->>'holderId'=$4
 			AND a.request->>'holderDomain'=$5 AND a.request->>'retentionPolicy'='release'
@@ -370,7 +384,7 @@ func (s *Store) PinOwner(ctx context.Context, check storagev1.PinOwnerCheck) sto
 	if err != nil {
 		return storagev1.OwnerUnknown
 	}
-	if releaseState == "tombstoned" || acquireState == "released" || acquireState == "expired" {
+	if (releaseState == "tombstoned" || releaseState == "failed") || acquireState == "released" || acquireState == "expired" {
 		return storagev1.OwnerAbsent
 	}
 	if (releaseState == "pin_pending" || releaseState == "ready") && (acquireState == "pending" || acquireState == "active") {
@@ -392,15 +406,15 @@ func (s *Store) PruneResolved(ctx context.Context) error {
 		return err
 	}
 	if _, err = tx.Exec(ctx, `DELETE FROM projects_release_pin_acquires WHERE release_id IN (
-		SELECT release_id FROM projects_releases WHERE state='tombstoned' AND cleanup_completed_at < clock_timestamp()-$1*interval '1 microsecond'
+		SELECT release_id FROM projects_releases WHERE state IN ('tombstoned','failed') AND cleanup_completed_at < clock_timestamp()-$1*interval '1 microsecond'
 	)`, historyTTL.Microseconds()); err != nil {
 		return err
 	}
 	if _, err = tx.Exec(ctx, `DELETE FROM projects_release_receipts WHERE expires_at < clock_timestamp()
-		OR release_id IN (SELECT release_id FROM projects_releases WHERE state='tombstoned' AND cleanup_completed_at < clock_timestamp()-$1*interval '1 microsecond')`, historyTTL.Microseconds()); err != nil {
+		OR release_id IN (SELECT release_id FROM projects_releases WHERE state IN ('tombstoned','failed') AND cleanup_completed_at < clock_timestamp()-$1*interval '1 microsecond')`, historyTTL.Microseconds()); err != nil {
 		return err
 	}
-	if _, err = tx.Exec(ctx, `DELETE FROM projects_releases WHERE state='tombstoned' AND cleanup_completed_at < clock_timestamp()-$1*interval '1 microsecond'`, historyTTL.Microseconds()); err != nil {
+	if _, err = tx.Exec(ctx, `DELETE FROM projects_releases WHERE state IN ('tombstoned','failed') AND cleanup_completed_at < clock_timestamp()-$1*interval '1 microsecond'`, historyTTL.Microseconds()); err != nil {
 		return err
 	}
 	if _, err = tx.Exec(ctx, `DELETE FROM projects_revision_receipts WHERE expires_at < clock_timestamp()`); err != nil {
@@ -410,7 +424,10 @@ func (s *Store) PruneResolved(ctx context.Context) error {
 		AND NOT EXISTS (SELECT 1 FROM projects_releases rel WHERE rel.workspace_id=r.workspace_id AND rel.project_id=r.project_id AND rel.revision_id=r.revision_id)`, historyTTL.Microseconds()); err != nil {
 		return err
 	}
-	if _, err = tx.Exec(ctx, `DELETE FROM platform_event_outbox WHERE sent_at IS NOT NULL AND sent_at < clock_timestamp()-$1*interval '1 microsecond'`, historyTTL.Microseconds()); err != nil {
+	if _, err = tx.Exec(ctx, `DELETE FROM projects_audit_actions a USING platform_event_outbox o WHERE a.event_id::text=o.event_id AND o.sent_at IS NOT NULL AND o.sent_at<clock_timestamp()-$1*interval '1 microsecond' AND a.occurred_at<clock_timestamp()-$1*interval '1 microsecond'`, historyTTL.Microseconds()); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(ctx, `DELETE FROM platform_event_outbox o WHERE sent_at IS NOT NULL AND sent_at < clock_timestamp()-$1*interval '1 microsecond' AND NOT EXISTS(SELECT 1 FROM projects_audit_actions a WHERE a.event_id::text=o.event_id)`, historyTTL.Microseconds()); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)

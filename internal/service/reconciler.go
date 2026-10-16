@@ -10,6 +10,7 @@ import (
 	"time"
 
 	storagev1 "github.com/leafrun/leafrun-contracts/storage/v1"
+	"github.com/leafrun/leafrun-platform/authn"
 	"github.com/leafrun/leafrun-projects/internal/store"
 )
 
@@ -44,12 +45,15 @@ func (r *Reconciler) RunOnce(ctx context.Context) error {
 			failures = append(failures, err)
 			break
 		}
-		if item.State == "tombstoned" {
+		if item.State == "tombstoned" || item.State == "failed" {
 			err = r.cleanupRelease(ctx, lease, item)
 		} else {
 			err = r.activateRelease(ctx, lease, item)
 		}
 		if err != nil {
+			if errors.Is(err, store.ErrAuthorityDenied) {
+				err = errors.Join(err, r.runtime.Store.FailPendingAuthority(authn.WithoutIdentity(ctx), lease, item.ReleaseID))
+			}
 			failures = append(failures, fmt.Errorf("reconcile release %q: %w", item.ReleaseID, err))
 		}
 	}
@@ -79,6 +83,11 @@ func (r *Reconciler) Run(ctx context.Context, interval time.Duration) error {
 }
 
 func (r *Reconciler) activateRelease(ctx context.Context, lease store.Lease, work store.ReleasePinWork) error {
+	var originalErr error
+	ctx, originalErr = r.runtime.restoreReleaseAuthority(ctx, work.ReleaseID)
+	if originalErr != nil {
+		return originalErr
+	}
 	if len(work.Acquires) == 0 {
 		return errors.New("release has no durable pin acquisition intent")
 	}
@@ -114,6 +123,10 @@ func (r *Reconciler) activateRelease(ctx context.Context, lease store.Lease, wor
 	if pin.State != "pending" {
 		return errors.New("persisted Storage pin is neither pending nor active")
 	}
+	ctx, originalErr = r.runtime.restoreReleaseAuthority(ctx, work.ReleaseID)
+	if originalErr != nil {
+		return originalErr
+	}
 	activated, err := r.runtime.Storage.ActivatePin(ctx, pin.PinID)
 	if err != nil {
 		if authoritativePinExpired(err) {
@@ -138,6 +151,7 @@ func (r *Reconciler) activateRelease(ctx context.Context, lease store.Lease, wor
 }
 
 func (r *Reconciler) cleanupRelease(ctx context.Context, lease store.Lease, work store.ReleasePinWork) error {
+	ctx = authn.WithoutIdentity(ctx)
 	if len(work.Acquires) == 0 {
 		return errors.New("tombstoned release has no durable acquisition intent")
 	}

@@ -59,7 +59,7 @@ func (r *Runtime) requireAccess(request *http.Request, actor projectsv1.Principa
 	if !projectsv1.ValidScope(scope) || !projectsv1.ValidIdentifier(actor.Subject) || !projectsv1.ValidIdentifier(actor.Domain) {
 		return fault(400, "invalid_scope", "A valid project scope and authenticated actor are required")
 	}
-	allowed, err := r.Access.Check(request.Context(), storagev1.AccessCheck{Principal: actor, Scope: scope, Operation: operation, ObjectID: objectID})
+	allowed, err := r.checkAccess(request.Context(), storagev1.AccessCheck{Principal: actor, Scope: scope, Operation: operation, ObjectID: objectID})
 	if err != nil {
 		return fault(503, "access_unavailable", "Projects could not verify current rights")
 	}

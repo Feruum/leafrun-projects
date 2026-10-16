@@ -15,8 +15,7 @@ import (
 )
 
 func (r *Runtime) generationAuthorized(request *http.Request) bool {
-	values := request.Header.Values("Authorization")
-	return len(values) == 1 && authorizedToken(values[0], r.Config.GenerationToken)
+	return r.localToken(request, r.Config.GenerationToken)
 }
 
 func (r *Runtime) handleResolve(w http.ResponseWriter, request *http.Request) {
@@ -29,6 +28,11 @@ func (r *Runtime) handleResolve(w http.ResponseWriter, request *http.Request) {
 	// fingerprint envelope need a little additional bounded space.
 	if err := decodeRequestLimit(w, request, &input, maxRequestBytes+(8<<10)); err != nil {
 		writeFault(w, err)
+		return
+	}
+	request, bindErr := r.trustedIdentity(request, input.Actor, input.Authority)
+	if bindErr != nil {
+		writeFault(w, bindErr)
 		return
 	}
 	encoded, err := json.Marshal(input.Selection)
@@ -64,6 +68,7 @@ func (r *Runtime) handleResolve(w http.ResponseWriter, request *http.Request) {
 }
 
 func (r *Runtime) resolve(request *http.Request, input projectsv1.ResolveRequest) (projectsv1.ResolvedExecution, error) {
+	request = generationSnapshotRequest(request)
 	selection := input.Selection
 	if err := r.requireGenerationAccess(request, input.Actor, selection.Scope); err != nil {
 		return projectsv1.ResolvedExecution{}, err
@@ -214,6 +219,12 @@ func (r *Runtime) handleCurrentRelease(w http.ResponseWriter, request *http.Requ
 		return
 	}
 	decision := projectsv1.CurrentReleaseDecision{}
+	var bindErr error
+	request, bindErr = r.trustedIdentity(request, input.Actor, input.Authority)
+	if bindErr != nil {
+		writeFault(w, bindErr)
+		return
+	}
 	if err := r.requireGenerationAccess(request, input.Actor, input.Scope); err != nil {
 		var failure *Fault
 		if errors.As(err, &failure) && failure.Status == 403 {

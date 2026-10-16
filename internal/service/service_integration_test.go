@@ -39,6 +39,11 @@ func TestRevisionQueryScopeRejectsDuplicateValues(t *testing.T) {
 }
 
 func openServiceTestStore(t *testing.T) *store.Store {
+	state, _ := openServiceTestStorePool(t)
+	return state
+}
+
+func openServiceTestStorePool(t *testing.T) (*store.Store, *pgxpool.Pool) {
 	t.Helper()
 	dsn := os.Getenv("PROJECTS_TEST_DATABASE_URL")
 	if dsn == "" {
@@ -94,7 +99,7 @@ func openServiceTestStore(t *testing.T) *store.Store {
 		}
 		admin.Close()
 	})
-	return state
+	return state, pool
 }
 
 type accessFixture struct {
@@ -262,7 +267,7 @@ func (f *fakeProjectsStorage) acquireRequests() []storagev1.AcquirePinRequest {
 
 func serviceRuntimeForTest(t *testing.T, state *store.Store, storage Storage, access *accessFixture) *Runtime {
 	t.Helper()
-	runtime, err := NewRuntime(state, storage, access, Config{
+	runtime, err := NewRuntime(state, storage, access, Config{AuthMode: "dev", DevFixtures: true,
 		Credentials:        map[string]projectsv1.Principal{testUserToken: {Subject: "demo", Domain: "core"}},
 		OwnerCallbackToken: "projects-owner-callback-secret",
 		TempDir:            t.TempDir(),
@@ -310,6 +315,7 @@ func TestRevisionHTTPAuthenticatesAndImportsExactScopedSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Authorization", "Bearer "+testUserToken)
 	response, err = http.DefaultClient.Do(request)
 	if err != nil {
@@ -331,6 +337,7 @@ func TestRevisionHTTPAuthenticatesAndImportsExactScopedSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Authorization", "Bearer "+testUserToken)
 	response, err = http.DefaultClient.Do(request)
 	if err != nil {
@@ -349,6 +356,7 @@ func TestRevisionHTTPAuthenticatesAndImportsExactScopedSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Authorization", "Bearer "+testUserToken)
 	request.Header.Set("X-User-Subject", "attacker")
 	response, err = http.DefaultClient.Do(request)
@@ -381,6 +389,7 @@ func TestRevisionHTTPAuthenticatesAndImportsExactScopedSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Authorization", "Bearer attacker-token")
 	response, err = http.DefaultClient.Do(request)
 	if err != nil {
@@ -396,6 +405,7 @@ func TestRevisionHTTPAuthenticatesAndImportsExactScopedSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Authorization", "Bearer "+testUserToken)
 	response, err = http.DefaultClient.Do(request)
 	if err != nil {
@@ -475,6 +485,7 @@ func TestReleaseCandidateHTTPReturnsAcceptedBeforeStorageActivation(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
+	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Authorization", "Bearer "+testUserToken)
 	response, err := http.DefaultClient.Do(request)
 	if err != nil {
@@ -501,6 +512,7 @@ func TestReleaseCandidateHTTPReturnsAcceptedBeforeStorageActivation(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
+	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Authorization", "Bearer "+testUserToken)
 	response, err = http.DefaultClient.Do(request)
 	if err != nil {
@@ -649,6 +661,7 @@ func TestOwnerCallbackReturnsUnknownWhenDatabaseCannotAnswer(t *testing.T) {
 	state := openServiceTestStore(t)
 	runtime := serviceRuntimeForTest(t, state, newFakeProjectsStorage(), &accessFixture{allowed: true})
 	request := httptest.NewRequest(http.MethodPost, "/internal/v1/checks/pin-owner", strings.NewReader(`{"scope":{"workspaceId":"demo","projectId":"owner"},"pinId":"pin_missing","objectId":"snap_missing","holderId":"leafrun-projects","holderDomain":"service"}`))
+	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Authorization", "Bearer projects-owner-callback-secret")
 	response := httptest.NewRecorder()
 	runtime.Handler().ServeHTTP(response, request)

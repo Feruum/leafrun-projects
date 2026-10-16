@@ -6,7 +6,9 @@ import (
 	"fmt"
 
 	"github.com/jackc/pgx/v5"
+	auditv1 "github.com/leafrun/leafrun-contracts/audit/v1"
 	projectsv1 "github.com/leafrun/leafrun-contracts/projects/v1"
+	"github.com/leafrun/leafrun-platform/events"
 )
 
 // SetPublication changes only current visibility. Frozen source, target and
@@ -40,6 +42,7 @@ func (s *Store) SetPublication(ctx context.Context, releaseID string, input proj
 	if state != "ready" || pinID == "" {
 		return projectsv1.Release{}, ErrInvalidState
 	}
+	var audit *events.AuditActionInput
 	if published != input.Published {
 		now, clockErr := dbNow(ctx, tx)
 		if clockErr != nil {
@@ -56,10 +59,31 @@ func (s *Store) SetPublication(ctx context.Context, releaseID string, input proj
 		if err = enqueueReleaseEvent(ctx, tx, scope, releaseID, aggregate+1, now, eventType, subject); err != nil {
 			return projectsv1.Release{}, err
 		}
+		name := auditv1.ActionReleaseRetire
+		if input.Published {
+			name = auditv1.ActionReleasePublish
+		}
+		ctx, audit, err = s.publicationAudit(ctx, MutationBinding{Scope: scope, Operation: "project.publish", ObjectID: releaseID}, aggregate+1, now, name)
+		if err != nil {
+			return projectsv1.Release{}, err
+		}
 	}
 	out, err := getReleaseTx(ctx, tx, releaseID, false)
 	if err != nil {
 		return projectsv1.Release{}, err
+	}
+	if err = enqueuePublicationAudit(ctx, tx, audit); err != nil {
+		return projectsv1.Release{}, err
+	}
+	if err = s.gateAuthority(ctx, tx, releaseID, false); err != nil {
+		return projectsv1.Release{}, err
+	}
+	var livePin bool
+	if err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM projects_release_pin_acquires WHERE release_id=$1 AND pin_id=$2 AND state='active' AND response->>'state'='active' AND (response->>'expiresAt')::timestamptz>clock_timestamp())`, releaseID, pinID).Scan(&livePin); err != nil {
+		return projectsv1.Release{}, err
+	}
+	if !livePin {
+		return projectsv1.Release{}, ErrInvalidState
 	}
 	if err = tx.Commit(ctx); err != nil {
 		return projectsv1.Release{}, fmt.Errorf("commit Projects publication: %w", err)

@@ -32,6 +32,8 @@ func faultFields(status int, code, message string, fields []projectsv1.FieldErro
 
 func storeFault(err error) error {
 	switch {
+	case errors.Is(err, store.ErrAuthorityDenied):
+		return fault(http.StatusForbidden, "forbidden", "Current authority does not permit this operation")
 	case errors.Is(err, store.ErrNotFound):
 		return fault(http.StatusNotFound, "not_found", "Projects record was not found")
 	case errors.Is(err, store.ErrConflict):

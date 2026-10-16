@@ -3,6 +3,8 @@ package service
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	storagev1 "github.com/leafrun/leafrun-contracts/storage/v1"
 	"net/http"
 	"sort"
 
@@ -12,6 +14,7 @@ import (
 )
 
 func (r *Runtime) handleForm(w http.ResponseWriter, request *http.Request) {
+	request = generationSnapshotRequest(request)
 	actor, ok := r.principal(request)
 	if !ok {
 		writeFault(w, fault(401, "unauthorized", "A configured Projects user credential is required"))
@@ -30,7 +33,7 @@ func (r *Runtime) handleForm(w http.ResponseWriter, request *http.Request) {
 	}
 	base, err := r.restoreSnapshot(request.Context(), release.Scope, release.SnapshotID)
 	if err != nil {
-		writeFault(w, err)
+		r.writeFormFault(w, request, actor, release, err)
 		return
 	}
 	defer base.core.Close()
@@ -40,7 +43,7 @@ func (r *Runtime) handleForm(w http.ResponseWriter, request *http.Request) {
 	}
 	resources, err := documentcore.SchemaResources(request.Context(), base.core.FS(), descriptor.InputSchema)
 	if err != nil {
-		writeFault(w, coreFault(err))
+		r.writeFormFault(w, request, actor, release, coreFault(err))
 		return
 	}
 	schema, present := resources[descriptor.InputSchema]
@@ -58,6 +61,24 @@ func (r *Runtime) handleForm(w http.ResponseWriter, request *http.Request) {
 			Scope: release.Scope, ReleaseID: id, Parameters: json.RawMessage(`{}`), FileRefs: map[string]generationv1.FileReference{}, Profile: descriptor.DefaultProfile, CachePolicy: "use",
 		}}
 	writeReleaseForm(w, form)
+}
+
+func (r *Runtime) writeFormFault(w http.ResponseWriter, request *http.Request, actor projectsv1.Principal, release projectsv1.Release, err error) {
+	allowed, checkErr := r.checkAccess(request.Context(), storagev1.AccessCheck{Principal: actor, Scope: release.Scope, Operation: "source.read", ObjectID: release.SnapshotID})
+	if checkErr != nil {
+		writeFault(w, fault(503, "access_unavailable", "Current source visibility is unavailable"))
+		return
+	}
+	if allowed {
+		writeFault(w, err)
+		return
+	}
+	status := 503
+	var original *Fault
+	if errors.As(err, &original) && (original.Status == 400 || original.Status == 403 || original.Status == 404 || original.Status == 409 || original.Status == 413 || original.Status == 422) {
+		status = original.Status
+	}
+	writeFault(w, fault(status, "form_unavailable", "The published form could not be prepared"))
 }
 
 // writeReleaseForm preserves the validated raw schema closure's byte budget.

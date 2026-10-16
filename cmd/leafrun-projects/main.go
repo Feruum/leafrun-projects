@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/leafrun/leafrun-platform/authn"
 	"log/slog"
 	"net/http"
 	"os"
@@ -12,6 +13,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	auditv1 "github.com/leafrun/leafrun-contracts/audit/v1"
+	proof "github.com/leafrun/leafrun-contracts/ownerproof/v1"
 	"github.com/leafrun/leafrun-contracts/storage/v1"
 	"github.com/leafrun/leafrun-platform/events"
 	"github.com/leafrun/leafrun-projects/internal/config"
@@ -76,6 +79,7 @@ func run() error {
 func serveEventRelay(ctx context.Context, cfg config.Config, pool *pgxpool.Pool) error {
 	connection, err := nats.Connect(cfg.NATSAddress,
 		nats.UserInfo(cfg.NATSUser, cfg.NATSPassword),
+		nats.CustomInboxPrefix("_INBOX.projects"),
 		nats.Name("projects"),
 		nats.Timeout(5*time.Second),
 		nats.MaxReconnects(-1),
@@ -90,7 +94,11 @@ func serveEventRelay(ctx context.Context, cfg config.Config, pool *pgxpool.Pool)
 	if err != nil {
 		return errors.New("configure Projects JetStream publisher")
 	}
-	return eventrelay.Run(ctx, pool, events.JetStreamPublisher{Client: jetStream})
+	publisher, err := events.NewOwnerAuditPublisher(events.JetStreamPublisher{Client: jetStream}, auditv1.ProducerProjects, []string{"leafrun.projects.release.candidate.v1", "leafrun.projects.release.ready.v1", "leafrun.projects.release.published.v1", "leafrun.projects.release.withdrawn.v1", "leafrun.projects.release.deleted.v1", "leafrun.projects.release.failed.v1"})
+	if err != nil {
+		return err
+	}
+	return eventrelay.Run(ctx, pool, publisher)
 }
 
 func newRuntime(state *store.Store, cfg config.Config) (*service.Runtime, error) {
@@ -103,7 +111,31 @@ func newRuntime(state *store.Store, cfg config.Config) (*service.Runtime, error)
 	if err != nil {
 		return nil, fmt.Errorf("configure Projects Access owner: %w", err)
 	}
+	var authenticator authn.Authenticator
+	var guard *authn.BrowserGuard
+	if cfg.AuthMode == "access" {
+		public, createErr := authn.NewClientWithCookieNames(cfg.OwnerURL, cfg.OwnerToken, authn.ConfiguredCookieNames(cfg.CookieName, cfg.GuestCookieName), transport)
+		if createErr != nil {
+			return nil, createErr
+		}
+		access.UseCurrent(public)
+		authenticator = public
+		guard, err = authn.NewBrowserGuard(cfg.BrowserOrigins, cfg.LoopbackHTTP)
+		if err != nil {
+			return nil, err
+		}
+	}
+	var importVerifier proof.SnapshotVerifier
+	if cfg.ImportVerifierToken != "" {
+		client, err := proof.NewClient(cfg.StorageURL, cfg.ImportStorageToken, transport)
+		if err != nil {
+			return nil, err
+		}
+		importVerifier = client
+	}
 	return service.NewRuntime(state, storageClient, access, service.Config{
+		ImportVerifierToken: cfg.ImportVerifierToken, ImportStorageVerifier: importVerifier,
+		AuthMode: cfg.AuthMode, DevFixtures: cfg.DevFixtures, Authenticator: authenticator, CookieName: cfg.CookieName, GuestCookieName: cfg.GuestCookieName, BrowserGuard: guard, InternalTokens: []string{cfg.OwnerToken, cfg.StorageToken, cfg.ImportStorageToken},
 		Credentials: cfg.Credentials, OwnerCallbackToken: cfg.OwnerCallbackToken, GenerationToken: cfg.GenerationToken,
 		TempDir: cfg.TempDir, StorageHolderID: service.ProjectsHolderID,
 		StorageHolderDomain: service.ProjectsHolderDomain,

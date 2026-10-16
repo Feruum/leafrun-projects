@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	accessv1 "github.com/leafrun/leafrun-contracts/access/v1"
 	"io"
 	"net/http"
 	"net/url"
@@ -14,6 +15,7 @@ import (
 
 	jsonvalue "github.com/leafrun/leafrun-contracts/jsonvalue/v1"
 	storagev1 "github.com/leafrun/leafrun-contracts/storage/v1"
+	"github.com/leafrun/leafrun-platform/authn"
 )
 
 type AccessChecker interface {
@@ -24,7 +26,10 @@ type OwnerAccess struct {
 	baseURL string
 	token   string
 	client  *http.Client
+	current *authn.Client
 }
+
+func (a *OwnerAccess) UseCurrent(client *authn.Client) { a.current = client }
 
 func NewOwnerAccess(baseURL, token string, client *http.Client) (*OwnerAccess, error) {
 	u, err := url.Parse(baseURL)
@@ -35,11 +40,19 @@ func NewOwnerAccess(baseURL, token string, client *http.Client) (*OwnerAccess, e
 		client = &http.Client{Timeout: 10 * time.Second}
 	}
 	copy := *client
+	copy.Jar = nil
 	copy.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	return &OwnerAccess{baseURL: strings.TrimRight(baseURL, "/"), token: token, client: &copy}, nil
 }
 
 func (a *OwnerAccess) Check(ctx context.Context, input storagev1.AccessCheck) (bool, error) {
+	if a.current != nil {
+		allowed, err := a.current.CheckStorage(ctx, input)
+		if errors.Is(err, accessv1.ErrUnauthenticated) || errors.Is(err, accessv1.ErrDenied) {
+			return false, nil
+		}
+		return allowed, err
+	}
 	if a == nil || a.client == nil || a.token == "" {
 		return false, errors.New("Projects owner access client is unavailable")
 	}

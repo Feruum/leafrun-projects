@@ -21,7 +21,7 @@ const testGeneratorToken = "projects-generation-only-user-token"
 func TestRuntimeRejectsUserCredentialCollidingWithOwnerServices(t *testing.T) {
 	state := openServiceTestStore(t)
 	for _, token := range []string{testGenerationToken, "projects-owner-callback-secret"} {
-		_, err := NewRuntime(state, newFakeProjectsStorage(), &accessFixture{allowed: true}, Config{
+		_, err := NewRuntime(state, newFakeProjectsStorage(), &accessFixture{allowed: true}, Config{AuthMode: "dev", DevFixtures: true,
 			Credentials:        map[string]projectsv1.Principal{token: {Subject: "ordinary-user", Domain: "user"}},
 			OwnerCallbackToken: "projects-owner-callback-secret", GenerationToken: testGenerationToken,
 		})
@@ -109,7 +109,7 @@ func newResolveTest(t *testing.T) *resolveTest {
 	source.resources[fileID] = storagev1.Resource{ResourceID: fileID, Scope: scope, Class: storagev1.ClassResource, SHA256: hex.EncodeToString(digest[:]), SizeBytes: int64(len(data))}
 	source.content[fileID] = data
 	access := &resolveAccess{scope: scope, fileID: fileID}
-	runtime, err := NewRuntime(state, source, access, Config{
+	runtime, err := NewRuntime(state, source, access, Config{AuthMode: "dev", DevFixtures: true,
 		Credentials:        map[string]projectsv1.Principal{testUserToken: {Subject: "demo", Domain: "core"}, testGeneratorToken: {Subject: "generator", Domain: "user"}},
 		OwnerCallbackToken: "projects-owner-callback-secret", GenerationToken: testGenerationToken, TempDir: t.TempDir(),
 	})

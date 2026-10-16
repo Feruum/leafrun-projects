@@ -13,6 +13,7 @@ import (
 
 	jsonvalue "github.com/leafrun/leafrun-contracts/jsonvalue/v1"
 	storagev1 "github.com/leafrun/leafrun-contracts/storage/v1"
+	"github.com/leafrun/leafrun-platform/authn"
 )
 
 const maxCredentialsJSON = 64 << 10
@@ -27,21 +28,28 @@ const (
 )
 
 type Config struct {
-	Role                  Role
-	HTTPAddr              string
-	DatabaseURL           string
-	StorageURL            string
-	StorageToken          string
-	OwnerURL              string
-	OwnerToken            string
-	OwnerCallbackToken    string
-	GenerationToken       string
-	NATSAddress           string
-	NATSUser              string
-	NATSPassword          string
-	Credentials           map[string]storagev1.Principal
-	ReconcileIntervalText string
-	TempDir               string
+	ImportVerifierToken, ImportStorageToken string
+	AuthMode                                string
+	DevFixtures                             bool
+	GuestCookieName                         string
+	CookieName                              string
+	BrowserOrigins                          []string
+	LoopbackHTTP                            bool
+	Role                                    Role
+	HTTPAddr                                string
+	DatabaseURL                             string
+	StorageURL                              string
+	StorageToken                            string
+	OwnerURL                                string
+	OwnerToken                              string
+	OwnerCallbackToken                      string
+	GenerationToken                         string
+	NATSAddress                             string
+	NATSUser                                string
+	NATSPassword                            string
+	Credentials                             map[string]storagev1.Principal
+	ReconcileIntervalText                   string
+	TempDir                                 string
 }
 
 func Load(getenv func(string) string) (Config, error) {
@@ -136,19 +144,57 @@ func Load(getenv func(string) string) (Config, error) {
 	if strings.ContainsAny(c.TempDir, "\x00\r\n") {
 		return Config{}, errors.New("PROJECTS_TEMP_DIR is invalid")
 	}
-	credentialJSON, err := required(getenv, "PROJECTS_CREDENTIALS_JSON")
-	if err != nil {
+	c.AuthMode = getenv("PROJECTS_AUTH_MODE")
+	c.ImportVerifierToken = getenv("PROJECTS_IMPORT_VERIFIER_TOKEN")
+	c.ImportStorageToken = getenv("PROJECTS_IMPORT_STORAGE_TOKEN")
+	if c.ImportVerifierToken != "" || c.ImportStorageToken != "" {
+		if !validBearerSecret(c.ImportVerifierToken) || !validBearerSecret(c.ImportStorageToken) || c.ImportVerifierToken == c.ImportStorageToken {
+			return Config{}, errors.New("dedicated Projects evidence credentials required")
+		}
+		for _, secret := range []string{c.StorageToken, c.OwnerToken, c.OwnerCallbackToken, c.GenerationToken} {
+			if secret == c.ImportVerifierToken || secret == c.ImportStorageToken {
+				return Config{}, errors.New("distinct Projects evidence credentials required")
+			}
+		}
+	}
+	c.DevFixtures = getenv("PROJECTS_DEV_FIXTURES") == "true"
+	c.CookieName = getenv("PROJECTS_SESSION_COOKIE")
+	c.GuestCookieName = getenv("LEAFRUN_GUEST_COOKIE_NAME")
+	c.LoopbackHTTP = getenv("PROJECTS_LOOPBACK_HTTP") == "true"
+	if err := authn.ConfiguredCookieNames(c.CookieName, c.GuestCookieName).Validate(); err != nil {
 		return Config{}, err
 	}
-	c.Credentials, err = ParseCredentials(credentialJSON)
-	if err != nil {
-		return Config{}, errors.New("PROJECTS_CREDENTIALS_JSON is invalid")
+	switch c.AuthMode {
+	case "dev":
+		if !c.DevFixtures {
+			return Config{}, errors.New("explicit Projects dev fixture gate required")
+		}
+		credentialJSON, credentialErr := required(getenv, "PROJECTS_CREDENTIALS_JSON")
+		if credentialErr != nil {
+			return Config{}, credentialErr
+		}
+		c.Credentials, err = ParseCredentials(credentialJSON)
+		if err != nil {
+			return Config{}, errors.New("PROJECTS_CREDENTIALS_JSON is invalid")
+		}
+	case "access":
+		if c.DevFixtures || getenv("PROJECTS_CREDENTIALS_JSON") != "" {
+			return Config{}, errors.New("Projects fixture fallback forbidden in Access mode")
+		}
+		if err = jsonvalue.Unmarshal([]byte(getenv("PROJECTS_BROWSER_ORIGINS_JSON")), &c.BrowserOrigins, 32<<10); err != nil {
+			return Config{}, errors.New("explicit Projects browser origins required")
+		}
+		if _, err = authn.NewBrowserGuard(c.BrowserOrigins, c.LoopbackHTTP); err != nil {
+			return Config{}, err
+		}
+	default:
+		return Config{}, errors.New("explicit Projects authentication mode required")
 	}
 	if c.GenerationToken == c.OwnerCallbackToken {
 		return Config{}, errors.New("Generation and Storage owner callback credentials must be distinct")
 	}
 	for token := range c.Credentials {
-		if token == c.GenerationToken || token == c.OwnerCallbackToken || token == c.StorageToken || token == c.OwnerToken {
+		if token == c.GenerationToken || token == c.OwnerCallbackToken || token == c.StorageToken || token == c.OwnerToken || token == c.ImportVerifierToken || token == c.ImportStorageToken {
 			return Config{}, errors.New("public user credentials must be distinct from service credentials")
 		}
 	}
